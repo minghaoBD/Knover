@@ -16,6 +16,7 @@
 from abc import abstractmethod, ABC
 import os
 
+from paddle.fluid.layer_helper import LayerHelper
 import numpy as np
 import paddle
 from paddle.distributed import init_parallel_env
@@ -29,6 +30,38 @@ from knover.optim.lr_scheduler import CosineDecay
 from knover.utils import to_lodtensor, get_tensor, str2bool
 from knover.utils.topo import Topology
 
+from paddleslim.quant import quant_aware, convert
+
+quant_config = {
+        'weight_quantize_type': 'abs_max',
+        'activation_quantize_type': 'moving_average_abs_max',
+        'weight_bits': 8,
+        'activation_bits': 8,
+        'not_quant_pattern': ['skip_quant'],
+        'quantize_op_types': ['conv2d', 'depthwise_conv2d', 'mul', 'matmul_v2'],
+        'dtype': 'int8',
+        'window_size': 10000,
+        'moving_rate': 0.9,
+        'onnx_format': True
+    }
+
+
+def pact(x):
+    helper = LayerHelper("pact", **locals())
+    dtype = 'float32'
+    init_thres = 20.0
+    u_param_attr = paddle.ParamAttr(
+        name=x.name + '_pact',
+        initializer=paddle.nn.initializer.Constant(value=init_thres),
+        regularizer=paddle.regularizer.L2Decay(0.0001),
+        learning_rate=1)
+    u_param = helper.create_parameter(
+        attr=u_param_attr, shape=[1], dtype=dtype)
+
+    part_a = paddle.nn.functional.relu(x - u_param)
+    part_b = paddle.nn.functional.relu(-u_param - x)
+    x = x - part_a + part_b
+    return x
 
 class Model(ABC):
     """Basic model wrapper of PaddlePaddle.
@@ -107,7 +140,7 @@ class Model(ABC):
         self.is_distributed = args.get("is_distributed", False)
         self.use_recompute = args.use_recompute
         self.checkpointing_every_n_layers = args.checkpointing_every_n_layers
-        self.use_amp = args.use_amp
+        self.use_amp = args.use_amp # amp setting to False under quantization mode
         self.amp_level = args.amp_level
         self.use_dynamic_loss_scaling = args.use_dynamic_loss_scaling
         self.amp_loss_scaling = args.amp_loss_scaling
@@ -215,7 +248,7 @@ class Model(ABC):
         Build training program, evaluation program and inference program. Only use in static graph mode.
         """
         self.startup_program = fluid.Program()
-
+  
         if self.run_infer:
             self.dtype = "float16" if self.use_amp else "float32"
 
@@ -229,6 +262,18 @@ class Model(ABC):
                     outputs = self.forward(inputs, is_infer=True)
                     predictions = self.infer(inputs, outputs)
                     self.infer_fetch_dict = predictions
+
+            self.infer_program = quant_aware(
+                self.infer_program,
+                self.place,
+                quant_config,
+                scope=None,
+                act_preprocess_func=None,
+                optimizer_func=None,
+                executor=self.exe,
+                return_program=True
+            )
+
             self.infer_program = self.infer_program.clone(for_test=True)
 
             self.program = self.infer_program
@@ -255,7 +300,30 @@ class Model(ABC):
                     self.eval_program = self.train_program.clone(for_test=True)
                     self.eval_fetch_dict = dict(**metrics)
 
-                    global_vars = fluid.default_main_program().global_block().vars
+                    self.train_program = quant_aware(
+                        self.train_program,
+                        self.place,
+                        quant_config,
+                        scope=None,
+                        act_preprocess_func=None,
+                        optimizer_func=self._optimizer,
+                        executor=self.exe,
+                        for_test=False,
+                        return_program=True
+                    )
+                    self.eval_program = quant_aware(
+                        self.eval_program,
+                        self.place,
+                        quant_config,
+                        scope=None,
+                        act_preprocess_func=None,
+                        optimizer_func=None,
+                        executor=self.exe,
+                        for_test=True,
+                        return_program=True
+                    )
+
+                    global_vars = self.train_program.global_block().vars
                     metrics["scheduled_lr"] = global_vars["learning_rate_0"]
                     if self.is_distributed and self.use_amp:
                         loss_scaling = global_vars["loss_scaling_0"]
@@ -291,14 +359,13 @@ class Model(ABC):
         def __predicate__(var):
             if is_checkpoint and not fluid.io.is_persistable(var):
                 return False
+            if '@scale' in var.name:
+                if not os.path.exists(os.path.join(model_path, var.name)):
+                    print('fail on scale {} doesnot exist'.format(var.name))
+                return os.path.exists(os.path.join(model_path, var.name))
             if not is_checkpoint and not fluid.io.is_parameter(var):
                 return False
-            # only load existing variable.
-            if os.path.exists(os.path.join(model_path, var.name)):
-                return True
-            else:
-                print(f"Warning: {var.name} does not exist.")
-                return False
+            return os.path.exists(os.path.join(model_path, var.name))
         fluid.io.load_vars(
             self.exe,
             model_path,
@@ -306,7 +373,8 @@ class Model(ABC):
             predicate=__predicate__)
         if is_checkpoint:
             print(f"Load model from checkpoint: {model_path}")
-            start_step = get_tensor("@LR_DECAY_COUNTER@")
+            #NOTE(minghaoBD): During quantization, we don't want to inheritate the learning rate from pretraiing.
+            start_step = None
             if start_step is not None:
                 self.args.start_step = start_step[0]
             if isinstance(self._lr_scheduler, lr.LRScheduler):
@@ -331,9 +399,39 @@ class Model(ABC):
             if isinstance(self._lr_scheduler, lr.LRScheduler):
                 lr_scheduler_dict_path = os.path.join(model_path, "__lr_scheduler__")
                 paddle.save(self._lr_scheduler.state_dict(), lr_scheduler_dict_path)
-            fluid.io.save_persistables(self.exe, model_path, self.program)
+            fluid.io.save_persistables(self.exe, model_path, self.eval_program)
+
+            feed_list = [var.name for var in self.feed_dict.values()]
+            fetch_list = list(self.eval_fetch_dict.values())
+            fluid.io.save_inference_model(
+                model_path,
+                feed_list,
+                fetch_list,
+                self.exe,
+                self.eval_program,
+                program_only=True)
+            paddle.fluid.io.save_inference_model(
+                    dirname='./debug_eval',
+                    model_filename='model.pdmodel',
+                    params_filename='model.pdiparams',
+                    feeded_var_names=feed_list,
+                    target_vars=fetch_list,
+                    executor=self.exe,
+                    main_program=self.eval_program
+                )
         else:
-            fluid.io.save_params(self.exe, model_path, self.program)
+            feed_list = [var.name for var in self.infer_feed_dict.values()]
+            fetch_list = list(self.infer_fetch_dict.values())
+            paddle.fluid.io.save_inference_model(
+                    dirname='./debug_infer',
+                    model_filename='model.pdmodel',
+                    params_filename='model.pdiparams',
+                    feeded_var_names=feed_list,
+                    target_vars=fetch_list,
+                    executor=self.exe,
+                    main_program=self.infer_program
+                )
+
         return
 
     def _get_feed(self, inputs):
