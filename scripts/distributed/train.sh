@@ -11,6 +11,7 @@ fi
 
 export FLAGS_sync_nccl_allreduce=1
 export FLAGS_fuse_parameter_memory_size=64
+export CUDA_VISIBLE_DEVICES=1
 
 mkdir -p ${save_path}
 

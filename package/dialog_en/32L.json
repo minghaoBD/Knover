@@ -13,5 +13,6 @@
   "num_attention_heads": 32,
   "num_hidden_layers": 32,
   "type_vocab_size": 2,
+  "role_type_size": 32,
   "vocab_size": 8001
 }
