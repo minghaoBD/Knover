@@ -128,28 +128,31 @@ class UnifiedTransformer(Model):
             size=[self.vocab_size, self.emb_size],
             dtype=self.dtype,
             param_attr=fluid.ParamAttr(
-                name=name + self.token_emb_name, initializer=self.param_initializer))
+                name=name + self.token_emb_name, initializer=self.param_initializer, learning_rate=0.0))
         type_emb_out = layers.embedding(
             input=type_ids,
             size=[self.type_size, self.emb_size],
             dtype=self.dtype,
             param_attr=fluid.ParamAttr(
-                name=name + self.type_emb_name, initializer=self.param_initializer))
+                name=name + self.type_emb_name, initializer=self.param_initializer, learning_rate=0.0))
         pos_emb_out = layers.embedding(
             input=pos_ids,
             size=[self.max_position_seq_len, self.emb_size],
             dtype=self.dtype,
             param_attr=fluid.ParamAttr(
-                name=name + self.pos_emb_name, initializer=self.param_initializer))
+                name=name + self.pos_emb_name, initializer=self.param_initializer, learning_rate=0.0))
         emb_out = token_emb_out + type_emb_out + pos_emb_out
-
+        token_emb_out.skip_quant = True
+        type_emb_out.skip_quant = True
+        pos_emb_out.skip_quant = True
         if self.use_role:
             role_emb_out = layers.embedding(
                 input=role_ids,
                 size=[self.role_type_size, self.emb_size],
                 dtype=self.dtype,
                 param_attr=fluid.ParamAttr(
-                    name=name + self.role_emb_name, initializer=self.param_initializer))
+                    name=name + self.role_emb_name, initializer=self.param_initializer, learning_rate=0.0))
+            role_emb_out.skip_quant = True
             emb_out = emb_out + role_emb_out
 
         # concat auxiliary memory embeddings
