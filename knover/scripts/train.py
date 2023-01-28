@@ -143,6 +143,7 @@ def train(args):
     timer = Timer()
     timer.start()
     print("Training is start.")
+
     for step, data in enumerate(train_generator(), args.start_step + 1):
         outputs = task.train_step(model, data)
         timer.pause()

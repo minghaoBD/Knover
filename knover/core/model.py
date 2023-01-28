@@ -188,6 +188,12 @@ class Model(ABC):
         self._build_programs()
         return
 
+    def skip_mask_lm_quant(self, skips=[]):
+        for block in self.train_program.blocks:
+            for op in block.ops:
+                if op.output_arg_names[0] in skips:
+                    op._set_attr("skip_quant", True)
+
     def _init_distributed_strategy(self):
         """Initialize distributed strategy."""
         exec_strategy = fluid.ExecutionStrategy()
@@ -309,31 +315,33 @@ class Model(ABC):
                     self.eval_program = self._clone(self.train_program)
                     self.eval_fetch_dict = dict(**metrics)
 
-                    # self.train_program = quant_aware(
-                    #     self.train_program,
-                    #     self.place,
-                    #     quant_config,
-                    #     scope=None,
-                    #     act_preprocess_func=None,
-                    #     optimizer_func=self._optimizer,
-                    #     executor=self.exe,
-                    #     for_test=False,
-                    #     return_program=True
-                    # )
-                    # self.eval_program = quant_aware(
-                    #     self.eval_program,
-                    #     self.place,
-                    #     quant_config,
-                    #     scope=None,
-                    #     act_preprocess_func=None,
-                    #     optimizer_func=None,
-                    #     executor=self.exe,
-                    #     for_test=True,
-                    #     return_program=True
-                    # )
+                    
+                    self.skip_mask_lm_quant(skips=['matmul_64.tmp_0', 'fc_192.tmp_0'])
 
-                    # global_vars = self.train_program.global_block().vars
-                    global_vars = fluid.default_main_program().global_block().vars
+                    self.train_program = quant_aware(
+                        self.train_program,
+                        self.place,
+                        quant_config,
+                        scope=None,
+                        act_preprocess_func=None,
+                        optimizer_func=None,
+                        executor=self.exe,
+                        for_test=False,
+                        return_program=True
+                    )
+                    self.eval_program = quant_aware(
+                        self.eval_program,
+                        self.place,
+                        quant_config,
+                        scope=None,
+                        act_preprocess_func=None,
+                        optimizer_func=None,
+                        executor=self.exe,
+                        for_test=True,
+                        return_program=True
+                    )
+
+                    global_vars = self.train_program.global_block().vars
 
                     metrics["scheduled_lr"] = global_vars["learning_rate_0"]
                     if self.is_distributed and self.use_amp:
